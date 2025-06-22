@@ -1,0 +1,17 @@
+.{
+    .name = .ZVPMS,
+
+    .version = "0.0.0",
+
+    .fingerprint = 0x81ee6fbfcc311886,
+
+    .minimum_zig_version = "0.14.1",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
