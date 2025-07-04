@@ -53,26 +53,23 @@ const Config = struct {
     }
 
     pub fn toJson(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
-        var string = std.ArrayList(u8).init(allocator);
-        defer string.deinit();
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
 
-        try string.appendSlice("{\n");
-
+        var obj = std.json.ObjectMap.init(aa);
         if (self.current_version) |version| {
-            try string.writer().print("  \"current_version\": \"{s}\",\n", .{version});
+            try obj.put("current_version", json.Value{ .string = version });
         } else {
-            try string.appendSlice("  \"current_version\": null,\n");
+            try obj.put("current_version", json.Value.null);
         }
-
-        try string.appendSlice("  \"installed_versions\": [\n");
-        for (self.installed_versions.items, 0..) |version, i| {
-            if (i > 0) try string.appendSlice(",\n");
-            try string.writer().print("    \"{s}\"", .{version});
+        var arr = std.json.Array.init(aa);
+        for (self.installed_versions.items) |version| {
+            try arr.append(json.Value{ .string = version });
         }
-        try string.appendSlice("\n  ]\n");
-        try string.appendSlice("}\n");
-
-        return string.toOwnedSlice();
+        try obj.put("installed_versions", json.Value{ .array = arr });
+        const json_value = json.Value{ .object = obj };
+        return try json.stringifyAlloc(allocator, json_value, .{ .whitespace = .indent_2 });
     }
 
     pub fn fromJson(allocator: std.mem.Allocator, json_str: []const u8) !Self {
@@ -135,11 +132,26 @@ fn getOsString() []const u8 {
     };
 }
 
-fn getFileExtension() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => ".zip",
-        else => ".tar.xz",
-    };
+fn getVersionInfo(version: []const u8) !struct { tarball: []const u8, shasum: []const u8 } {
+    const index_url = "https://ziglang.org/download/index.json";
+    const index_data = try get(index_url);
+    defer __allocator.free(index_data);
+
+    var parsed = try json.parseFromSlice(json.Value, __allocator, index_data, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const version_entry = root.get(version) orelse return error.VersionNotFound;
+    const arch = getArchString();
+    const os = getOsString();
+    const arch_os = try std.fmt.allocPrint(__allocator, "{s}-{s}", .{arch, os});
+    defer __allocator.free(arch_os);
+    const arch_os_entry = version_entry.object.get(arch_os) orelse return error.ArchOsNotSupported;
+    const tarball = arch_os_entry.object.get("tarball").?.string;
+    const shasum = arch_os_entry.object.get("shasum").?.string;
+    const tarball_dup = try __allocator.dupe(u8, tarball);
+    const shasum_dup = try __allocator.dupe(u8, shasum);
+    return .{ .tarball = tarball_dup, .shasum = shasum_dup };
 }
 
 pub fn init() !void {
@@ -153,7 +165,7 @@ pub fn init() !void {
         else => return err,
     };
 
-    const versions_path = try std.fs.path.join(__allocator, &.{ home.?, "versions" });
+    const versions_path = try std.fs.path.join(__allocator, &.{ home.?, "versions echip" });
     defer __allocator.free(versions_path);
 
     std.fs.makeDirAbsolute(versions_path) catch |err| switch (err) {
@@ -210,13 +222,21 @@ fn saveConfig() !void {
 }
 
 pub fn installVersion(version: []const u8) !void {
-    const arch = getArchString();
-    const os = getOsString();
-    const ext = getFileExtension();
+    const version_info = getVersionInfo(version) catch |err| switch (err) {
+        error.VersionNotFound => {
+            std.debug.print("Version {s} not found\n", .{version});
+            return;
+        },
+        error.ArchOsNotSupported => {
+            std.debug.print("Architecture and OS combination not supported for version {s}\n", .{version});
+            return;
+        },
+        else => return err,
+    };
+    defer __allocator.free(version_info.tarball);
+    defer __allocator.free(version_info.shasum);
 
-    const download_url = try std.fmt.allocPrint(__allocator, "https://ziglang.org/download/{s}/zig-{s}-{s}-{s}{s}", .{ version, arch, os, version, ext });
-    defer __allocator.free(download_url);
-
+    const download_url = version_info.tarball;
     std.debug.print("Downloading Zig {s} from: {s}\n", .{ version, download_url });
 
     const version_dir_path = try std.fs.path.join(__allocator, &.{ home.?, "versions", version });
@@ -230,16 +250,17 @@ pub fn installVersion(version: []const u8) !void {
         else => return err,
     };
 
+    const uri = try std.Uri.parse(download_url);
+    const filename = std.fs.path.basename(uri.path.raw);
+    const temp_archive_path = try std.fs.path.join(__allocator, &.{ version_dir_path, filename });
+    defer __allocator.free(temp_archive_path);
+
     const archive_data = get(download_url) catch |err| {
         std.debug.print("Failed to download Zig {s}: {}\n", .{ version, err });
-
         std.fs.deleteTreeAbsolute(version_dir_path) catch {};
         return err;
     };
     defer __allocator.free(archive_data);
-
-    const temp_archive_path = try std.fmt.allocPrint(__allocator, "{s}/temp_archive{s}", .{ version_dir_path, ext });
-    defer __allocator.free(temp_archive_path);
 
     const temp_file = try std.fs.createFileAbsolute(temp_archive_path, .{});
     defer temp_file.close();
@@ -256,22 +277,15 @@ pub fn installVersion(version: []const u8) !void {
 }
 
 fn extractArchive(archive_path: []const u8, extract_to: []const u8) !void {
-    const ext = getFileExtension();
-
-    if (std.mem.eql(u8, ext, ".zip")) {
-        std.debug.print("ZIP extraction not yet implemented. Please extract manually to: {s}\n", .{extract_to});
-    } else {
-        var child = std.process.Child.init(&.{ "tar", "-xf", archive_path, "-C", extract_to, "--strip-components=1" }, __allocator);
-        const result = try child.spawnAndWait();
-
-        switch (result) {
-            .Exited => |code| {
-                if (code != 0) {
-                    return error.ExtractionFailed;
-                }
-            },
-            else => return error.ExtractionFailed,
-        }
+    var child = std.process.Child.init(&.{ "tar", "-xf", archive_path, "-C", extract_to, "--strip-components=1" }, __allocator);
+    const result = try child.spawnAndWait();
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                return error.ExtractionFailed;
+            }
+        },
+        else => return error.ExtractionFailed,
     }
 }
 
