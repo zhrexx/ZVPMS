@@ -251,7 +251,7 @@ pub fn installVersion(version: []const u8) !void {
     };
 
     const uri = try std.Uri.parse(download_url);
-    const filename = std.fs.path.basename(uri.path.raw);
+    const filename = std.fs.path.basename(uri.path.percent_encoded);
     const temp_archive_path = try std.fs.path.join(__allocator, &.{ version_dir_path, filename });
     defer __allocator.free(temp_archive_path);
 
