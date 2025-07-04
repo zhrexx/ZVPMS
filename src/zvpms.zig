@@ -76,23 +76,23 @@ const Config = struct {
         var parsed = try json.parseFromSlice(json.Value, allocator, json_str, .{});
         defer parsed.deinit();
 
-        var config__ = Self.init(allocator);
+        var config_instance = Self.init(allocator);
 
         const root = parsed.value.object;
 
         if (root.get("current_version")) |current| {
             if (current != .null) {
-                config__.current_version = try allocator.dupe(u8, current.string);
+                config_instance.current_version = try allocator.dupe(u8, current.string);
             }
         }
 
         if (root.get("installed_versions")) |versions| {
             for (versions.array.items) |version| {
-                try config__.addVersion(allocator, version.string);
+                try config_instance.addVersion(allocator, version.string);
             }
         }
 
-        return config__;
+        return config_instance;
     }
 };
 
@@ -144,7 +144,7 @@ fn getVersionInfo(version: []const u8) !struct { tarball: []const u8, shasum: []
     const version_entry = root.get(version) orelse return error.VersionNotFound;
     const arch = getArchString();
     const os = getOsString();
-    const arch_os = try std.fmt.allocPrint(__allocator, "{s}-{s}", .{arch, os});
+    const arch_os = try std.fmt.allocPrint(__allocator, "{s}-{s}", .{ arch, os });
     defer __allocator.free(arch_os);
     const arch_os_entry = version_entry.object.get(arch_os) orelse return error.ArchOsNotSupported;
     const tarball = arch_os_entry.object.get("tarball").?.string;
@@ -165,7 +165,7 @@ pub fn init() !void {
         else => return err,
     };
 
-    const versions_path = try std.fs.path.join(__allocator, &.{ home.?, "versions echip" });
+    const versions_path = try std.fs.path.join(__allocator, &.{ home.?, "versions" });
     defer __allocator.free(versions_path);
 
     std.fs.makeDirAbsolute(versions_path) catch |err| switch (err) {
@@ -186,8 +186,10 @@ pub fn init() !void {
         const file_content = try conf_file.?.readToEndAlloc(__allocator, 1024 * 1024);
         defer __allocator.free(file_content);
 
-        config.deinit(__allocator);
-        config = Config.fromJson(__allocator, file_content) catch Config.init(__allocator);
+        if (file_content.len > 0) {
+            config.deinit(__allocator);
+            config = Config.fromJson(__allocator, file_content) catch Config.init(__allocator);
+        }
     }
 }
 
@@ -221,30 +223,79 @@ fn saveConfig() !void {
     }
 }
 
+const Version = struct { major: u32, minor: u32, patch: u32 };
+
+fn parseVersion(version: []const u8) !Version {
+    var it = std.mem.splitAny(u8, version, ".");
+    const major_str = it.next() orelse return error.InvalidVersion;
+    const minor_str = it.next() orelse return error.InvalidVersion;
+    const patch_str = it.next() orelse return error.InvalidVersion;
+    if (it.next() != null) return error.InvalidVersion;
+    const major = try std.fmt.parseInt(u32, major_str, 10);
+    const minor = try std.fmt.parseInt(u32, minor_str, 10);
+    const patch = try std.fmt.parseInt(u32, patch_str, 10);
+    return .{ .major = major, .minor = minor, .patch = patch };
+}
+
+fn getLatestVersion() ![]const u8 {
+    const index_url = "https://ziglang.org/download/index.json";
+    const index_data = try get(index_url);
+    defer __allocator.free(index_data);
+
+    var parsed = try json.parseFromSlice(json.Value, __allocator, index_data, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    var latest_version: ?[]const u8 = null;
+    var latest_parsed: ?Version = null;
+
+    for (root.keys()) |key| {
+        if (std.mem.startsWith(u8, key, "0.")) {
+            const parsed_version = parseVersion(key) catch continue;
+            if (latest_parsed == null or
+                (parsed_version.major > latest_parsed.?.major) or
+                (parsed_version.major == latest_parsed.?.major and parsed_version.minor > latest_parsed.?.minor) or
+                (parsed_version.major == latest_parsed.?.major and parsed_version.minor == latest_parsed.?.minor and parsed_version.patch > latest_parsed.?.patch)) {
+                latest_parsed = parsed_version;
+                latest_version = key;
+            }
+        }
+    }
+
+    if (latest_version) |ver| {
+        return try __allocator.dupe(u8, ver);
+    } else {
+        return error.NoVersionsFound;
+    }
+}
+
 pub fn installVersion(version: []const u8) !void {
-    const version_info = getVersionInfo(version) catch |err| switch (err) {
-        error.VersionNotFound => {
-            std.debug.print("Version {s} not found\n", .{version});
-            return;
-        },
-        error.ArchOsNotSupported => {
-            std.debug.print("Architecture and OS combination not supported for version {s}\n", .{version});
-            return;
-        },
-        else => return err,
-    };
+    var actual_version: []const u8 = undefined;
+    var should_free_version = false;
+
+    if (std.mem.eql(u8, version, "master")) {
+        actual_version = try getLatestVersion();
+        should_free_version = true;
+        std.debug.print("Installing 'master' as version {s}\n", .{actual_version});
+    } else {
+        actual_version = version;
+    }
+    defer if (should_free_version) __allocator.free(actual_version);
+
+    const version_info = try getVersionInfo(actual_version);
     defer __allocator.free(version_info.tarball);
     defer __allocator.free(version_info.shasum);
 
     const download_url = version_info.tarball;
-    std.debug.print("Downloading Zig {s} from: {s}\n", .{ version, download_url });
+    std.debug.print("Downloading Zig {s} from: {s}\n", .{ actual_version, download_url });
 
-    const version_dir_path = try std.fs.path.join(__allocator, &.{ home.?, "versions", version });
+    const version_dir_path = try std.fs.path.join(__allocator, &.{ home.?, "versions", actual_version });
     defer __allocator.free(version_dir_path);
 
     std.fs.makeDirAbsolute(version_dir_path) catch |err| switch (err) {
         error.PathAlreadyExists => {
-            std.debug.print("Version {s} already exists\n", .{version});
+            std.debug.print("Version {s} already exists\n", .{actual_version});
             return;
         },
         else => return err,
@@ -256,7 +307,7 @@ pub fn installVersion(version: []const u8) !void {
     defer __allocator.free(temp_archive_path);
 
     const archive_data = get(download_url) catch |err| {
-        std.debug.print("Failed to download Zig {s}: {}\n", .{ version, err });
+        std.debug.print("Failed to download Zig {s}: {}\n", .{ actual_version, err });
         std.fs.deleteTreeAbsolute(version_dir_path) catch {};
         return err;
     };
@@ -270,10 +321,9 @@ pub fn installVersion(version: []const u8) !void {
 
     std.fs.deleteFileAbsolute(temp_archive_path) catch {};
 
-    try config.addVersion(__allocator, version);
+    try config.addVersion(__allocator, actual_version);
     try saveConfig();
-
-    std.debug.print("Successfully installed Zig {s}\n", .{version});
+    std.debug.print("Successfully installed Zig {s}\n", .{actual_version});
 }
 
 fn extractArchive(archive_path: []const u8, extract_to: []const u8) !void {
@@ -340,6 +390,89 @@ pub fn removeVersion(version: []const u8) !void {
     std.debug.print("Removed version: {s}\n", .{version});
 }
 
+pub fn renameVersion(old_version: []const u8, new_version: []const u8) !void {
+    var found = false;
+    for (config.installed_versions.items) |installed| {
+        if (std.mem.eql(u8, installed, old_version)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        std.debug.print("Version {s} is not installed\n", .{old_version});
+        return error.VersionNotInstalled;
+    }
+
+    for (config.installed_versions.items) |installed| {
+        if (std.mem.eql(u8, installed, new_version)) {
+            std.debug.print("Version {s} already exists\n", .{new_version});
+            return error.VersionAlreadyExists;
+        }
+    }
+
+    const old_dir_path = try std.fs.path.join(__allocator, &.{ home.?, "versions", old_version });
+    defer __allocator.free(old_dir_path);
+    const new_dir_path = try std.fs.path.join(__allocator, &.{ home.?, "versions", new_version });
+    defer __allocator.free(new_dir_path);
+
+    try std.fs.renameAbsolute(old_dir_path, new_dir_path);
+
+    for (config.installed_versions.items, 0..) |installed, i| {
+        if (std.mem.eql(u8, installed, old_version)) {
+            __allocator.free(installed);
+            config.installed_versions.items[i] = try __allocator.dupe(u8, new_version);
+            break;
+        }
+    }
+
+    if (config.current_version != null and std.mem.eql(u8, config.current_version.?, old_version)) {
+        __allocator.free(config.current_version.?);
+        config.current_version = try __allocator.dupe(u8, new_version);
+    }
+
+    try saveConfig();
+    std.debug.print("Renamed version {s} to {s}\n", .{ old_version, new_version });
+}
+
+pub fn updateVersion(version: []const u8) !void {
+    const parsed_version = try parseVersion(version);
+    const major = parsed_version.major;
+    const minor = parsed_version.minor;
+
+    const index_url = "https://ziglang.org/download/index.json";
+    const index_data = try get(index_url);
+    defer __allocator.free(index_data);
+
+    var parsed = try json.parseFromSlice(json.Value, __allocator, index_data, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    var latest_patch: ?[]const u8 = null;
+    var latest_patch_num: u32 = 0;
+
+    for (root.keys()) |key| {
+        const parsed_key = parseVersion(key) catch continue;
+        if (parsed_key.major == major and parsed_key.minor == minor) {
+            if (latest_patch == null or parsed_key.patch > latest_patch_num) {
+                latest_patch_num = parsed_key.patch;
+                latest_patch = key;
+            }
+        }
+    }
+
+    if (latest_patch) |latest| {
+        if (std.mem.eql(u8, latest, version)) {
+            std.debug.print("Version {s} is already the latest in its series\n", .{version});
+        } else {
+            std.debug.print("Updating {s} to {s}\n", .{ version, latest });
+            try installVersion(latest);
+        }
+    } else {
+        std.debug.print("No versions found for {d}.{d}.x\n", .{ major, minor });
+    }
+}
+
 pub fn fileExists(path: []const u8) bool {
     std.fs.accessAbsolute(path, .{}) catch return false;
     return true;
@@ -375,5 +508,5 @@ pub fn get(url: []const u8) ![]u8 {
         return error.FileTooLarge;
     }
 
-    return try req.reader().readAllAlloc(__allocator, 500*1024*1024);
+    return try req.reader().readAllAlloc(__allocator, 500 * 1024 * 1024);
 }

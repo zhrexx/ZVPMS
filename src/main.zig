@@ -10,6 +10,8 @@ const ZvpmsCommand = enum {
     help,
     version,
     zig,
+    rename,
+    update,
 };
 
 const ZigCommand = struct {
@@ -83,6 +85,8 @@ fn parseCommand(arg: []const u8) ZvpmsCommand {
     if (std.mem.eql(u8, arg, "remove")) return .remove;
     if (std.mem.eql(u8, arg, "help")) return .help;
     if (std.mem.eql(u8, arg, "version")) return .version;
+    if (std.mem.eql(u8, arg, "rename")) return .rename;
+    if (std.mem.eql(u8, arg, "update")) return .update;
     return .zig;
 }
 
@@ -93,6 +97,8 @@ fn printHelp() void {
     std.debug.print("  zvpms use <version>        Set the current Zig version\n", .{});
     std.debug.print("  zvpms list                 List installed versions\n", .{});
     std.debug.print("  zvpms remove <version>     Remove an installed version\n", .{});
+    std.debug.print("  zvpms rename <old> <new>   Rename an installed version\n", .{});
+    std.debug.print("  zvpms update <version>     Update a version to the latest patch\n", .{});
     std.debug.print("  zvpms version              Show ZVPMS version\n", .{});
     std.debug.print("  zvpms help                 Show this help message\n\n", .{});
     std.debug.print("Zig Compiler Proxy:\n", .{});
@@ -168,6 +174,22 @@ pub fn main() !void {
             const zig_args: [][]const u8 = @ptrCast(args[1..]);
             const zig_cmd = ZigCommand.init(allocator, zig_args);
             try zig_cmd.execute();
+        },
+        .rename => {
+            if (args.len < 4) {
+                std.debug.print("Error: rename command requires two arguments: <old_version> <new_version>\n", .{});
+                std.debug.print("Usage: zvpms rename <old_version> <new_version>\n", .{});
+                return;
+            }
+            try zvpms.renameVersion(args[2], args[3]);
+        },
+        .update => {
+            if (args.len < 3) {
+                std.debug.print("Error: update command requires a version argument\n", .{});
+                std.debug.print("Usage: zvpms update <version>\n", .{});
+                return;
+            }
+            try zvpms.updateVersion(args[2]);
         },
     }
 }
